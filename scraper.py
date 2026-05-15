@@ -2,26 +2,21 @@
 """
 Shopee Pipeline — Production scraper.
 
-Orchestrates GoLogin profiles via API, attaches Playwright over CDP,
-extracts the three core metrics, and upserts them into Supabase Postgres.
+Pipeline:
+  GoLogin (local profile) ─► Playwright (CDP) ─► Shopee dashboards ─► Supabase
 
-Schema (per row):
-    date              YYYY-MM-DD
-    profile_name      channel name (e.g. lonaharper)
-    open_channel_cost number (เปิดช่อง)
-    ads_cost          number (คอยน์+แอด)
-    commission        number (ค่าคอมมิชชัน)
-    account_group     group name (e.g. kshomeaxie29)
+Per profile it visits TWO pages and extracts TWO numbers:
+  1. Affiliate Dashboard  → 'ค่าคอมมิชชันโดยประมาณ'  → commission
+  2. Live Ads page        → 'ค่าโฆษณา'                → ads_cost
 
-Rule: NEVER store 'total' rows. The dashboard sums these client-side.
+Both extractors are resilient: any failure (timeout / element missing / parse
+error) ⇒ value becomes 0. The script never crashes on a single bad profile.
 
 Usage:
-  python scraper.py                              # today, profiles.json, concurrency from .env
+  python scraper.py                            # today, all profiles
+  python scraper.py --limit 1 --dry-run        # smoke test 1 profile, no DB
+  python scraper.py --test-parse               # exercise number parser only
   python scraper.py --target-date 2026-05-14
-  python scraper.py --profiles other.json
-  python scraper.py --concurrency 3
-  python scraper.py --dry-run                    # scrape but don't write
-  python scraper.py --limit 5                    # smoke test
 """
 
 import argparse
@@ -36,272 +31,401 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import httpx
 from dotenv import load_dotenv
 from playwright.async_api import (
     async_playwright,
-    TimeoutError as PWTimeout,
     Error as PWError,
+    TimeoutError as PWTimeout,
 )
 
 load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 GOLOGIN_TOKEN        = os.getenv("GOLOGIN_TOKEN", "")
-SHOPEE_DASHBOARD_URL = os.getenv("SHOPEE_DASHBOARD_URL", "https://affiliate.shopee.co.th/dashboard")
-DATABASE_URL         = os.getenv("DATABASE_URL", "")
+GOLOGIN_PROFILES_DIR = os.getenv(
+    "GOLOGIN_PROFILES_DIR",
+    r"C:\Users\SATHAPORN\AppData\Roaming\GoLogin\profiles",
+)
+SHOPEE_AFFILIATE_URL = os.getenv(
+    "SHOPEE_AFFILIATE_URL",
+    "https://affiliate.shopee.co.th/dashboard",
+)
+SHOPEE_LIVE_ADS_URL = os.getenv(
+    "SHOPEE_LIVE_ADS_URL",
+    "https://creator.shopee.co.th/insight/live-ads",
+)
+DEFAULT_GROUP   = os.getenv("DEFAULT_GROUP", "kshomeaxie29")
+DATABASE_URL    = os.getenv("DATABASE_URL", "")
+CONCURRENCY     = int(os.getenv("CONCURRENCY", "1"))     # local browser = serial by default
+NAV_TIMEOUT_MS  = int(os.getenv("NAV_TIMEOUT_MS", "30000"))
+LABEL_WAIT_MS   = int(os.getenv("LABEL_WAIT_MS",  "15000"))
 
-CONCURRENCY            = int(os.getenv("CONCURRENCY", "5"))
-NAV_TIMEOUT_MS         = int(os.getenv("NAV_TIMEOUT_MS", "15000"))
-WORKER_HARD_TIMEOUT_S  = int(os.getenv("WORKER_HARD_TIMEOUT_S", "60"))
+PROFILES_PATH = Path(__file__).parent / "profiles.json"
 
-GOLOGIN_API_BASE = "https://api.gologin.com"
-PROFILES_PATH    = Path(__file__).parent / "profiles.json"
 
-# CSS selectors — customise for the Shopee dashboard layout you're scraping
-SEL = {
-    "open_channel_cost": "[data-testid='open-channel-cost'], .open-channel-cost, [data-key='open_channel']",
-    "ads_cost":          "[data-testid='ads-cost'],          .ads-cost,          [data-key='coin_ads']",
-    "commission":        "[data-testid='commission'],        .commission-value,  [data-key='commission']",
+# ════════════════════════════════════════════════════════════════════════════
+#                          NUMBER PARSING (Thai + Western)
+# ════════════════════════════════════════════════════════════════════════════
+
+THAI_SUFFIX = {
+    # Longest first (matters because 'หมื่น' shares chars with 'ล้าน' etc.)
+    "ล้าน":  1_000_000,
+    "แสน":  100_000,
+    "หมื่น": 10_000,
+    "พัน":  1_000,
+}
+WESTERN_SUFFIX = {
+    "k": 1_000, "K": 1_000,
+    "m": 1_000_000, "M": 1_000_000,
+    "b": 1_000_000_000, "B": 1_000_000_000,
 }
 
-# Blockers: if any of these are visible, mark the row as Failed with that reason
-BLOCKER_PATTERNS = {
-    "captcha": [
-        "iframe[src*='recaptcha']",
-        "iframe[src*='hcaptcha']",
-        "iframe[title*='captcha' i]",
-        ".captcha-container",
-        "#captcha",
-    ],
-    "otp": [
-        "input[name='otp']",
-        "input[name='code']",
-        "input[autocomplete='one-time-code']",
-        "input[name='verification-code']",
-    ],
-    "verify": [
-        "text=/verify your identity/i",
-        ".verify-identity",
-    ],
+
+def parse_thai_number(text: str) -> float:
+    """
+    Convert localized number strings to a float.
+
+    Handles:
+      '8.4พัน'    → 8400.0
+      '฿2.2k'     → 2200.0
+      '1,234'     → 1234.0
+      '2ล้าน'     → 2000000.0
+      '3.5 หมื่น'  → 35000.0
+      '฿ 8.4 พัน'  → 8400.0
+      '0', '', '-' → 0.0
+
+    Returns 0.0 on ANY failure — never raises.
+    """
+    if not text:
+        return 0.0
+
+    # Strip currency, commas, whitespace
+    s = re.sub(r"[฿$,\s]", "", str(text).strip())
+    if not s or s in ("-", "—", "–"):
+        return 0.0
+
+    # Try Thai suffixes (longest first)
+    for suffix, mult in THAI_SUFFIX.items():
+        if s.endswith(suffix):
+            body = s[:-len(suffix)]
+            try:
+                return float(body) * mult
+            except ValueError:
+                return 0.0
+
+    # Try Western suffixes (1 char)
+    if s and s[-1] in WESTERN_SUFFIX:
+        try:
+            return float(s[:-1]) * WESTERN_SUFFIX[s[-1]]
+        except ValueError:
+            return 0.0
+
+    # Plain number
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if m:
+        try:
+            return float(m.group(0))
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#                          CORE EXTRACTOR (the headline function)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Walk the DOM near a given label and return the closest visible numeric text.
+# Runs inside the page so it sees the same layout the user does.
+_FIND_NUMBER_NEAR_LABEL_JS = r"""
+(labelText) => {
+  // What "looks like a number" in this dashboard's locale
+  const NUM_RE = /^\s*[฿$]?\s*-?[\d,.]+\s*(พัน|หมื่น|แสน|ล้าน|k|K|m|M|b|B)?\s*$/u;
+
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+  };
+
+  // 1) Find the deepest element whose OWN text contains the label.
+  //    (Deepest = the actual UI label, not a wrapping container.)
+  const all = Array.from(document.querySelectorAll('body *'));
+  const labelEls = all.filter(el => {
+    if (!isVisible(el)) return false;
+    const own = Array.from(el.childNodes)
+      .filter(n => n.nodeType === Node.TEXT_NODE)
+      .map(n => n.textContent).join('').trim();
+    return own && own.includes(labelText);
+  });
+  if (!labelEls.length) return null;
+
+  // Pick the deepest match
+  labelEls.sort((a, b) => {
+    const depth = (n) => { let d = 0; while (n) { d++; n = n.parentElement; } return d; };
+    return depth(b) - depth(a);
+  });
+  const labelEl = labelEls[0];
+
+  const isNumeric = (txt) => {
+    if (!txt) return false;
+    const t = txt.trim();
+    if (!t || t.length > 30) return false;
+    return NUM_RE.test(t);
+  };
+
+  // 2) Check direct siblings of the label
+  if (labelEl.parentElement) {
+    for (const sib of labelEl.parentElement.children) {
+      if (sib === labelEl) continue;
+      if (!isVisible(sib)) continue;
+      const txt = sib.textContent.trim();
+      if (isNumeric(txt)) return txt;
+    }
+  }
+
+  // 3) Walk up to 5 ancestors; for each, scan its descendants
+  let ancestor = labelEl.parentElement;
+  for (let depth = 0; depth < 5 && ancestor; depth++) {
+    for (const child of ancestor.querySelectorAll('*')) {
+      if (child === labelEl) continue;
+      if (child.contains(labelEl) || labelEl.contains(child)) continue;
+      if (!isVisible(child)) continue;
+      const txt = child.textContent.trim();
+      if (isNumeric(txt)) return txt;
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  return null;
 }
+"""
 
 
-# ─── Data structure ───────────────────────────────────────────────────────────
+async def _find_number_near_label(page, label_text: str, timeout_ms: int = LABEL_WAIT_MS) -> float:
+    """
+    Wait for `label_text` to appear, then return the nearest numeric value
+    as a float. Returns 0.0 on any failure.
+    """
+    try:
+        loc = page.get_by_text(label_text, exact=False).first
+        await loc.wait_for(state="visible", timeout=timeout_ms)
+    except PWTimeout:
+        print(f"  [warn] label '{label_text}' did not appear within {timeout_ms}ms")
+        return 0.0
+    except Exception as e:
+        print(f"  [warn] waiting for '{label_text}' failed: {type(e).__name__}: {e}")
+        return 0.0
+
+    try:
+        raw = await page.evaluate(_FIND_NUMBER_NEAR_LABEL_JS, label_text)
+    except Exception as e:
+        print(f"  [warn] DOM walk failed for '{label_text}': {e}")
+        return 0.0
+
+    if raw is None:
+        print(f"  [warn] '{label_text}' found but no numeric value nearby")
+        return 0.0
+
+    value = parse_thai_number(raw)
+    print(f"  [ok]   '{label_text}' → raw='{raw}' → {value}")
+    return value
+
+
+async def extract_shopee_data(page) -> dict:
+    """
+    Extract two metrics from the Shopee Affiliate platform.
+
+    Navigates to:
+      • Affiliate Dashboard  → finds the number next to 'ค่าคอมมิชชันโดยประมาณ'
+      • Live Ads page        → finds the number under 'ค่าโฆษณา'
+
+    Both values are localized (e.g. '8.4พัน', '฿2.2k') and converted to ints
+    in baht (8400, 2200).
+
+    Returns:
+        {"commission": float, "ads_cost": float}
+
+    Robust to failures:
+      - page navigation timeout    → that metric = 0
+      - label not found on page    → that metric = 0
+      - number can't be parsed     → that metric = 0
+    Never raises.
+    """
+    result = {"commission": 0.0, "ads_cost": 0.0}
+
+    # ───── 1. Commission (Affiliate Dashboard) ────────────────────────
+    try:
+        print(f"  → goto {SHOPEE_AFFILIATE_URL}")
+        await page.goto(SHOPEE_AFFILIATE_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+        # Some pages render KPIs lazily — give them a moment
+        await page.wait_for_load_state("networkidle", timeout=8000)
+    except PWTimeout:
+        print(f"  [warn] affiliate page nav timeout")
+    except Exception as e:
+        print(f"  [warn] affiliate nav: {type(e).__name__}: {e}")
+    else:
+        result["commission"] = await _find_number_near_label(page, "ค่าคอมมิชชันโดยประมาณ")
+
+    # ───── 2. Ads Cost (Live Ads page) ────────────────────────────────
+    try:
+        print(f"  → goto {SHOPEE_LIVE_ADS_URL}")
+        await page.goto(SHOPEE_LIVE_ADS_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle", timeout=8000)
+    except PWTimeout:
+        print(f"  [warn] live-ads page nav timeout")
+    except Exception as e:
+        print(f"  [warn] live-ads nav: {type(e).__name__}: {e}")
+    else:
+        result["ads_cost"] = await _find_number_near_label(page, "ค่าโฆษณา")
+
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#                          GoLogin (local profile launcher)
+# ════════════════════════════════════════════════════════════════════════════
+
+def start_gologin_local(profile_id: str):
+    """
+    Start a GoLogin profile from local storage.
+
+    Returns a tuple (gl, ws_url) where:
+      gl     — GoLogin SDK instance (caller must .stop() it)
+      ws_url — CDP debugger URL for Playwright.connect_over_cdp()
+    """
+    from gologin import GoLogin
+    gl = GoLogin({
+        "token":       GOLOGIN_TOKEN,
+        "profile_id":  profile_id,
+        "tmpdir":      GOLOGIN_PROFILES_DIR,
+    })
+    debug_address = gl.start()  # blocks; returns "127.0.0.1:35873"
+    return gl, f"http://{debug_address}"
+
+
+def stop_gologin(gl) -> None:
+    """Best-effort stop — never raises."""
+    try:
+        gl.stop()
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#                          Per-profile worker
+# ════════════════════════════════════════════════════════════════════════════
+
 @dataclass
-class ScrapeResult:
+class Result:
     profile_id:        str
     profile_name:      str
     account_group:     str
     date:              str
     scraped_at:        str
-    open_channel_cost: Optional[float] = None
-    ads_cost:          Optional[float] = None
-    commission:        Optional[float] = None
+    open_channel_cost: float = 0.0
+    ads_cost:          float = 0.0
+    commission:        float = 0.0
     status:            str = "Failed"
     error_reason:      Optional[str] = None
     error_detail:      Optional[str] = None
     duration_ms:       int = 0
 
 
-# ─── GoLogin API ──────────────────────────────────────────────────────────────
-class GoLoginError(Exception):
-    pass
-
-
-async def gl_start(http: httpx.AsyncClient, profile_id: str) -> str:
-    url = f"{GOLOGIN_API_BASE}/browser/{profile_id}/web"
-    r = await http.post(url, timeout=30)
-    if r.status_code != 200:
-        raise GoLoginError(f"start HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    ws = data.get("wsUrl") or data.get("wsEndpoint") or data.get("debuggerAddress")
-    if not ws:
-        raise GoLoginError(f"no debugger address: {data}")
-    if not (ws.startswith("ws://") or ws.startswith("wss://")):
-        ws = f"ws://{ws}"
-    return ws
-
-
-async def gl_stop(http: httpx.AsyncClient, profile_id: str) -> None:
-    url = f"{GOLOGIN_API_BASE}/browser/{profile_id}/web"
-    try:
-        await http.delete(url, timeout=15)
-    except Exception:
-        pass
-
-
-# ─── Page helpers ─────────────────────────────────────────────────────────────
-async def detect_blocker(page) -> Optional[str]:
-    for kind, selectors in BLOCKER_PATTERNS.items():
-        for sel in selectors:
-            try:
-                if await page.locator(sel).first.is_visible(timeout=400):
-                    return kind
-            except Exception:
-                continue
-    return None
-
-
-_NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
-
-
-def parse_number(text: str) -> Optional[float]:
-    """'฿ 12,345.67' → 12345.67"""
-    if not text:
-        return None
-    m = _NUM_RE.search(text.replace(" ", ""))
-    if not m:
-        return None
-    try:
-        return float(m.group(0).replace(",", ""))
-    except ValueError:
-        return None
-
-
-async def safe_extract_number(page, css: str, timeout_ms: int = 5000) -> Optional[float]:
-    try:
-        loc = page.locator(css).first
-        await loc.wait_for(state="visible", timeout=timeout_ms)
-        return parse_number((await loc.inner_text()).strip())
-    except Exception:
-        return None
-
-
-# ─── Single-profile worker ────────────────────────────────────────────────────
-async def _scrape_one(playwright, http, profile, target_date) -> ScrapeResult:
+async def scrape_one(playwright, profile, target_date) -> Result:
     pid   = profile["id"]
     name  = profile.get("name", pid)
-    group = profile.get("group", "")
-    res = ScrapeResult(
+    group = profile.get("group", DEFAULT_GROUP)
+
+    res = Result(
         profile_id=pid,
         profile_name=name,
         account_group=group,
         date=target_date,
         scraped_at=datetime.now().isoformat(),
     )
-    started = time.time()
+    t0 = time.time()
+    gl = None
     browser = None
-    ws_url  = None
 
+    print(f"\n┌─ [{name}]  group={group}  ({pid})")
     try:
-        # 1. Start GoLogin profile
+        # 1. Start local GoLogin profile
         try:
-            ws_url = await asyncio.wait_for(gl_start(http, pid), timeout=25)
-        except (asyncio.TimeoutError, GoLoginError) as e:
-            res.error_reason, res.error_detail = "gologin_start", str(e)
+            gl, ws_url = await asyncio.to_thread(start_gologin_local, pid)
+            print(f"│  gologin started → {ws_url}")
+        except Exception as e:
+            res.error_reason = "gologin_start"
+            res.error_detail = str(e)[:300]
+            print(f"│  ✗ gologin start failed: {e}")
             return res
 
         # 2. Attach Playwright via CDP
         try:
             browser = await playwright.chromium.connect_over_cdp(ws_url)
         except PWError as e:
-            res.error_reason, res.error_detail = "gologin_start", f"CDP attach failed: {e}"
+            res.error_reason = "cdp_attach"
+            res.error_detail = str(e)[:300]
+            print(f"│  ✗ cdp attach failed: {e}")
             return res
 
         ctx  = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
-        # 3. Navigate
-        try:
-            await page.goto(SHOPEE_DASHBOARD_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-        except PWTimeout:
-            res.error_reason = "nav_timeout"
-            return res
+        # 3. Extract data (returns 0 for failures — never raises)
+        data = await extract_shopee_data(page)
+        res.commission = data["commission"]
+        res.ads_cost   = data["ads_cost"]
+        res.status     = "Success"
+        print(f"│  ✓ commission={res.commission}  ads_cost={res.ads_cost}")
 
-        # 4. Detect blockers
-        blocker = await detect_blocker(page)
-        if blocker:
-            res.error_reason = blocker
-            return res
-
-        # 5. Extract metrics
-        openc = await safe_extract_number(page, SEL["open_channel_cost"])
-        ads   = await safe_extract_number(page, SEL["ads_cost"])
-        comm  = await safe_extract_number(page, SEL["commission"])
-
-        if all(v is None for v in (openc, ads, comm)):
-            res.error_reason = "no_metrics"
-            return res
-
-        res.open_channel_cost = openc or 0
-        res.ads_cost          = ads or 0
-        res.commission        = comm or 0
-        res.status            = "Success"
-        return res
-
-    except PWError as e:
-        res.error_reason, res.error_detail = "playwright", str(e)[:300]
-        return res
     except Exception as e:
         res.error_reason = "unknown"
         res.error_detail = f"{type(e).__name__}: {str(e)[:200]}"
-        return res
+        print(f"│  ✗ unknown error: {e}")
     finally:
         if browser:
             try:
                 await browser.close()
             except Exception:
                 pass
-        if ws_url:
-            await gl_stop(http, pid)
-        res.duration_ms = int((time.time() - started) * 1000)
+        if gl:
+            await asyncio.to_thread(stop_gologin, gl)
+        res.duration_ms = int((time.time() - t0) * 1000)
+        print(f"└─ done in {res.duration_ms}ms")
+
+    return res
 
 
-async def scrape_with_timeout(playwright, http, profile, target_date) -> ScrapeResult:
-    try:
-        return await asyncio.wait_for(
-            _scrape_one(playwright, http, profile, target_date),
-            timeout=WORKER_HARD_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        return ScrapeResult(
-            profile_id=profile["id"],
-            profile_name=profile.get("name", profile["id"]),
-            account_group=profile.get("group", ""),
-            date=target_date,
-            scraped_at=datetime.now().isoformat(),
-            status="Failed",
-            error_reason="hard_timeout",
-            duration_ms=WORKER_HARD_TIMEOUT_S * 1000,
-        )
+# ════════════════════════════════════════════════════════════════════════════
+#                          Orchestrator
+# ════════════════════════════════════════════════════════════════════════════
 
-
-# ─── Orchestrator ─────────────────────────────────────────────────────────────
 async def orchestrate(profiles, target_date, concurrency):
     sem = asyncio.Semaphore(concurrency)
-    results = []
-    headers = {"Authorization": f"Bearer {GOLOGIN_TOKEN}"}
 
-    async with httpx.AsyncClient(headers=headers) as http:
-        async with async_playwright() as pw:
-            async def run(profile):
-                async with sem:
-                    return await scrape_with_timeout(pw, http, profile, target_date)
+    async with async_playwright() as pw:
+        async def run(profile):
+            async with sem:
+                return await scrape_one(pw, profile, target_date)
 
-            tasks = [asyncio.create_task(run(p)) for p in profiles]
-            total = len(tasks)
-            done = 0
-            for fut in asyncio.as_completed(tasks):
-                r = await fut
-                results.append(r)
-                done += 1
-                tag = "OK " if r.status == "Success" else "FAIL"
-                err = f" [{r.error_reason}]" if r.error_reason else ""
-                print(f"  [{done:>3}/{total}] {tag} {r.profile_name:<28} {r.duration_ms:>5}ms{err}")
-    return results
+        return await asyncio.gather(*(run(p) for p in profiles))
 
 
-# ─── DB writer (UPSERT — never duplicates a (profile, date) pair) ────────────
+# ════════════════════════════════════════════════════════════════════════════
+#                          Supabase writer (UPSERT)
+# ════════════════════════════════════════════════════════════════════════════
+
 def write_results(results) -> int:
-    """Upsert successful rows. Failed rows are skipped (kept clean per the rule)."""
+    """Upsert successful rows. Failed scrapes are NOT written (DB stays clean)."""
     if not DATABASE_URL:
         print("[warn] DATABASE_URL not set — skipping DB write")
         return 0
 
     rows = [
-        (r.date, r.profile_name, r.open_channel_cost or 0,
-         r.ads_cost or 0, r.commission or 0, r.account_group, r.scraped_at)
+        (r.date, r.profile_name, r.open_channel_cost,
+         r.ads_cost, r.commission, r.account_group, r.scraped_at)
         for r in results if r.status == "Success"
     ]
     if not rows:
@@ -311,10 +435,10 @@ def write_results(results) -> int:
     conn = psycopg2.connect(DATABASE_URL)
     try:
         c = conn.cursor()
-        sql = """
+        c.executemany("""
             INSERT INTO shopee_metrics
-                (date, profile_name, open_channel_cost, ads_cost, commission,
-                 account_group, scraped_at)
+                (date, profile_name, open_channel_cost, ads_cost,
+                 commission, account_group, scraped_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (profile_name, date) DO UPDATE SET
                 open_channel_cost = EXCLUDED.open_channel_cost,
@@ -322,29 +446,72 @@ def write_results(results) -> int:
                 commission        = EXCLUDED.commission,
                 account_group     = EXCLUDED.account_group,
                 scraped_at        = EXCLUDED.scraped_at
-        """
-        c.executemany(sql, rows)
+        """, rows)
         conn.commit()
         return len(rows)
     finally:
         conn.close()
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#                          Parse self-test
+# ════════════════════════════════════════════════════════════════════════════
+
+PARSE_TESTS = [
+    ("8.4พัน",     8400),
+    ("฿2.2k",      2200),
+    ("฿ 8.4 พัน",  8400),
+    ("1,234",      1234),
+    ("2ล้าน",      2_000_000),
+    ("3.5หมื่น",   35_000),
+    ("100แสน",     10_000_000),
+    ("฿0",         0),
+    ("",           0),
+    ("-",          0),
+    ("12,345.67",  12345.67),
+    ("2.5M",       2_500_000),
+]
+
+
+def run_parse_tests() -> bool:
+    print("Running parse_thai_number self-tests…\n")
+    ok = 0
+    for raw, expected in PARSE_TESTS:
+        actual = parse_thai_number(raw)
+        tag = "PASS" if abs(actual - expected) < 0.01 else "FAIL"
+        if tag == "PASS":
+            ok += 1
+        print(f"  [{tag}] {raw!r:<18} → {actual:<12}  expected {expected}")
+    total = len(PARSE_TESTS)
+    print(f"\n{ok}/{total} passed")
+    return ok == total
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#                          CLI
+# ════════════════════════════════════════════════════════════════════════════
+
 def main():
-    parser = argparse.ArgumentParser(description="Shopee Pipeline — production scraper")
+    parser = argparse.ArgumentParser(description="Shopee Pipeline — local GoLogin scraper")
     parser.add_argument("--target-date", default=datetime.now().strftime("%Y-%m-%d"))
     parser.add_argument("--profiles", default=str(PROFILES_PATH))
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     parser.add_argument("--limit", type=int, default=0, help="Only scrape first N profiles")
     parser.add_argument("--dry-run", action="store_true", help="Scrape but don't write")
+    parser.add_argument("--test-parse", action="store_true", help="Run parse_thai_number tests and exit")
     args = parser.parse_args()
+
+    if args.test_parse:
+        sys.exit(0 if run_parse_tests() else 1)
 
     if not GOLOGIN_TOKEN:
         print("ERROR: GOLOGIN_TOKEN missing in .env", file=sys.stderr); sys.exit(1)
     if not Path(args.profiles).exists():
         print(f"ERROR: {args.profiles} not found — copy profiles.example.json first", file=sys.stderr)
         sys.exit(1)
+    if not Path(GOLOGIN_PROFILES_DIR).exists():
+        print(f"WARN: GoLogin profiles dir not found: {GOLOGIN_PROFILES_DIR}", file=sys.stderr)
+        print("      The SDK will download profiles from cloud on first use.", file=sys.stderr)
 
     with open(args.profiles, encoding="utf-8") as f:
         profiles = json.load(f)
@@ -354,12 +521,14 @@ def main():
     if args.limit > 0:
         profiles = profiles[:args.limit]
 
-    db_target = "Supabase/Postgres" if DATABASE_URL else "<no DB>"
     print(f"┌─ Shopee scrape · {args.target_date}")
-    print(f"│  Profiles:   {len(profiles)}  (concurrency {args.concurrency})")
-    print(f"│  Target URL: {SHOPEE_DASHBOARD_URL}")
-    print(f"│  DB:         {db_target}{'  [dry-run]' if args.dry_run else ''}")
-    print(f"└─ Starting…\n")
+    print(f"│  Profiles:        {len(profiles)}  (concurrency {args.concurrency})")
+    print(f"│  Default group:   {DEFAULT_GROUP}")
+    print(f"│  Profiles dir:    {GOLOGIN_PROFILES_DIR}")
+    print(f"│  Affiliate URL:   {SHOPEE_AFFILIATE_URL}")
+    print(f"│  Live Ads URL:    {SHOPEE_LIVE_ADS_URL}")
+    print(f"│  DB:              {'Supabase' if DATABASE_URL else 'NONE'}{'  [dry-run]' if args.dry_run else ''}")
+    print(f"└─ Starting…")
 
     t0 = time.time()
     results = asyncio.run(orchestrate(profiles, args.target_date, args.concurrency))
@@ -367,7 +536,8 @@ def main():
 
     success = sum(1 for r in results if r.status == "Success")
     failed  = len(results) - success
-    print(f"\nFinished in {dt:.1f}s — {success} ok · {failed} fail "
+    print(f"\n═══════════════════════════════════════════════════════════")
+    print(f"Finished in {dt:.1f}s — {success} ok · {failed} fail "
           f"({success / len(results) * 100:.1f}% success)")
 
     if failed:
@@ -381,12 +551,11 @@ def main():
 
     if args.dry_run:
         print("\n--dry-run: skipping DB write")
-        for r in results[:5]:
-            if r.status == "Success":
-                print(f"  {r.profile_name}: open={r.open_channel_cost} ads={r.ads_cost} comm={r.commission}")
+        for r in results:
+            print(f"  {r.profile_name:<20} commission={r.commission:<10} ads_cost={r.ads_cost}")
     else:
         n = write_results(results)
-        print(f"\nUpserted {n} rows to database")
+        print(f"\nUpserted {n} rows to Supabase")
 
 
 if __name__ == "__main__":
