@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shopee Pipeline — Glass Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── Topbar ─────────────────────────────────────────────────────── -->
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-mark">S</div>
+      <div class="brand-text">
+        <h1>Shopee Pipeline</h1>
+        <p>GoLogin × Playwright · 400-profile orchestrator</p>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="status-pill warn" id="statusPill">
+      <span class="dot"></span>
+      <span id="statusText">Connecting…</span>
+    </div>
+    <button class="btn" id="refreshBtn">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+        <path d="M3.5 9a9 9 0 0 1 14.85-3.36L23 10"/>
+        <path d="M20.5 15a9 9 0 0 1-14.85 3.36L1 14"/>
+      </svg>
+      Refresh
+    </button>
+    <button class="btn btn-primary">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/>
+      </svg>
+      Run Batch
+    </button>
+  </div>
+
+  <!-- ── KPI cards ──────────────────────────────────────────────────── -->
+  <div class="kpi-row">
+    <div class="kpi cyan">
+      <div class="label">
+        <span class="ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+            <circle cx="12" cy="7" r="4"/>
+          </svg>
+        </span>
+        Profiles Today
+      </div>
+      <div class="value" id="kpiTotal">0</div>
+      <div class="sub" id="kpiTotalSub">—</div>
+    </div>
+
+    <div class="kpi sun">
+      <div class="label">
+        <span class="ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9"/>
+            <path d="M12 7v10 M9 10c0-1.3 1.3-2 3-2s3 .7 3 2-1.3 2-3 2-3 .7-3 2 1.3 2 3 2 3-.7 3-2"/>
+          </svg>
+        </span>
+        Total Ads Cost
+      </div>
+      <div class="value" id="kpiCost">฿0</div>
+      <div class="sub">sum of successful runs</div>
+    </div>
+
+    <div class="kpi violet">
+      <div class="label">
+        <span class="ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2l3 7 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1z"/>
+          </svg>
+        </span>
+        Est. Commission
+      </div>
+      <div class="value" id="kpiComm">฿0</div>
+      <div class="sub" id="kpiCommSub">—</div>
+    </div>
+
+    <div class="kpi mint">
+      <div class="label">
+        <span class="ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 17l6-6 4 4 8-8 M21 7h-5 M21 7v5"/>
+          </svg>
+        </span>
+        Average ROAS
+      </div>
+      <div class="value" id="kpiRoas">0.00×</div>
+      <div class="sub" id="kpiRoasSub">—</div>
+    </div>
+  </div>
+
+  <!-- ── Filter bar ─────────────────────────────────────────────────── -->
+  <div class="filterbar">
+    <span class="filter-label">DATE</span>
+    <span class="field">
+      <select id="filterDate">
+        <option value="all">All dates</option>
+      </select>
+    </span>
+
+    <span class="filter-label" style="margin-left: 8px">STATUS</span>
+    <div class="seg" id="segStatus" role="tablist">
+      <button data-value="all"      aria-pressed="true">All</button>
+      <button data-value="Success"  class="seg-success" aria-pressed="false">Success</button>
+      <button data-value="Failed"   class="seg-fail"    aria-pressed="false">Failed</button>
+    </div>
+
+    <input id="searchInput" class="search-input" placeholder="Search profile name or ID…" />
+  </div>
+
+  <!-- ── Data table ─────────────────────────────────────────────────── -->
+  <div class="data-card">
+    <header>
+      <div>
+        <h2>Latest Extractions</h2>
+        <div class="hint">Newest scrape result per row. Click a row to drill in (coming soon).</div>
+      </div>
+      <span class="badge muted" id="rowCount">0 rows</span>
+    </header>
+
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Profile</th>
+          <th>Date</th>
+          <th class="num">Ads Cost</th>
+          <th class="num">Est. Commission</th>
+          <th class="num">ROAS</th>
+          <th>Status</th>
+          <th class="num">Duration</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="7" class="empty"><span class="spinner"></span> Loading…</td></tr>
+      </tbody>
+    </table>
+
+    <div class="tfoot">
+      <span id="lastSync">—</span>
+      <span>Powered by FastAPI · SQLite</span>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
