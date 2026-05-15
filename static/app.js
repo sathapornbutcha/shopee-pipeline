@@ -42,11 +42,12 @@
   // ─── State ─────────────────────────────────────────────────────────────
   const state = {
     rows: [],
-    filterDate:  'all',
+    filterDate:  'last3',     // default: most recent 3 dates with data
     filterGroup: 'all',
     filterQuery: '',
     apiUp: null,
     loading: false,
+    knownDates: [],           // sorted desc, set by populateDates()
   };
 
   // ─── DOM ───────────────────────────────────────────────────────────────
@@ -143,9 +144,15 @@
   }
 
   function populateDates(dates) {
-    const cur = el.dateSel.value || 'all';
-    el.dateSel.innerHTML = '<option value="all">ทุกวัน</option>' +
+    state.knownDates = (dates || []).slice();   // sorted desc by API
+    const cur = el.dateSel.value || state.filterDate;
+    el.dateSel.innerHTML =
+      '<option value="last3">3 วันล่าสุด</option>' +
+      '<option value="all">ทุกวัน</option>' +
       dates.map(d => `<option value="${d}"${d === cur ? ' selected' : ''}>${d}</option>`).join('');
+    // Restore the user's selection (or default to last3)
+    el.dateSel.value = cur;
+    if (el.dateSel.value === '') el.dateSel.value = 'last3';
   }
 
   function populateGroups(groups) {
@@ -157,8 +164,14 @@
   // ─── Filtering (pure function, used by both render + totals) ───────────
   function filteredRows() {
     const q = state.filterQuery.trim().toLowerCase();
+    // 'last3' = the 3 most recent dates that have data
+    const last3 = state.knownDates.slice(0, 3);
     return state.rows
-      .filter(r => state.filterDate  === 'all' || r.date          === state.filterDate)
+      .filter(r => {
+        if (state.filterDate === 'all')   return true;
+        if (state.filterDate === 'last3') return last3.includes(r.date);
+        return r.date === state.filterDate;
+      })
       .filter(r => state.filterGroup === 'all' || r.account_group === state.filterGroup)
       .filter(r => !q
         || (r.profile_name  || '').toLowerCase().includes(q)
@@ -245,14 +258,14 @@
 
     el.tbody.innerHTML = rows.map(rowHTML).join('');
 
-    // Real-time sum row in <tfoot>
+    // Real-time sum row in <tfoot> — exact precision so totals match the table
     el.tfootSum.innerHTML = `
       <tr class="sum-row">
         <td colspan="3"><strong>รวม (${rows.length} แถว)</strong></td>
-        <td class="num"><strong>${fmtMoney(totals.open)}</strong></td>
-        <td class="num"><strong>${fmtMoney(totals.ads)}</strong></td>
-        <td class="num"><strong>${fmtMoney(totals.commission)}</strong></td>
-        <td class="num"><strong class="${totals.net >= 0 ? 'pos' : 'neg'}">${fmtMoney(totals.net)}</strong></td>
+        <td class="num"><strong>${fmtMoneyExact(totals.open)}</strong></td>
+        <td class="num"><strong>${fmtMoneyExact(totals.ads)}</strong></td>
+        <td class="num"><strong>${fmtMoneyExact(totals.commission)}</strong></td>
+        <td class="num"><strong class="${totals.net >= 0 ? 'pos' : 'neg'}">${fmtMoneyExact(totals.net)}</strong></td>
       </tr>`;
   }
 
@@ -273,14 +286,15 @@
         </td>
         <td><span class="badge muted">${r.date}</span></td>
         <td>${r.account_group ? `<span class="badge muted">${escapeHTML(r.account_group)}</span>` : '<span class="dim">—</span>'}</td>
-        <td class="num">${fmtMoney(+r.open_channel_cost)}</td>
-        <td class="num">${fmtMoney(+r.ads_cost)}</td>
-        <td class="num">${fmtMoney(+r.commission)}</td>
-        <td class="num ${net >= 0 ? 'pos' : 'neg'}">${fmtMoney(net)}</td>
+        <td class="num">${fmtMoneyExact(+r.open_channel_cost)}</td>
+        <td class="num">${fmtMoneyExact(+r.ads_cost)}</td>
+        <td class="num">${fmtMoneyExact(+r.commission)}</td>
+        <td class="num ${net >= 0 ? 'pos' : 'neg'}">${fmtMoneyExact(net)}</td>
       </tr>`;
   }
 
   // ─── Utils ─────────────────────────────────────────────────────────────
+  // Abbreviated format for KPI summary cards (e.g. ฿1.2M, ฿8.4k)
   function fmtMoney(v) {
     if (v == null || isNaN(v)) return '—';
     const sign = v < 0 ? '-' : '';
@@ -288,6 +302,20 @@
     if (abs >= 1_000_000) return sign + '฿' + (abs / 1_000_000).toFixed(2) + 'M';
     if (abs >= 1_000)     return sign + '฿' + (abs / 1_000).toFixed(1) + 'k';
     return sign + '฿' + Math.round(abs).toLocaleString();
+  }
+  // Exact format for table cells — full precision with comma separators.
+  // Below 1000: '฿800'.  Above: '฿1,234' or '฿2,200,000'. Never abbreviated.
+  function fmtMoneyExact(v) {
+    if (v == null || isNaN(v)) return '—';
+    if (v === 0) return '฿0';
+    const sign = v < 0 ? '-' : '';
+    const abs = Math.abs(v);
+    // Show decimals only if there are any (e.g. ฿1,234.56)
+    const hasDecimals = Math.round(abs) !== abs;
+    const formatted = hasDecimals
+      ? abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      : Math.round(abs).toLocaleString('en-US');
+    return sign + '฿' + formatted;
   }
   function escapeHTML(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({

@@ -27,7 +27,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -46,13 +46,13 @@ GOLOGIN_PROFILES_DIR = os.getenv(
     "GOLOGIN_PROFILES_DIR",
     r"C:\Users\SATHAPORN\AppData\Roaming\GoLogin\profiles",
 )
-SHOPEE_AFFILIATE_URL = os.getenv(
+SHOPEE_AFFILIATE_URL_BASE = os.getenv(
     "SHOPEE_AFFILIATE_URL",
     "https://affiliate.shopee.co.th/dashboard",
 )
-SHOPEE_LIVE_ADS_URL = os.getenv(
-    "SHOPEE_LIVE_ADS_URL",
-    "https://creator.shopee.co.th/insight/live-ads",
+SHOPEE_LIVE_ADS_BASE = os.getenv(
+    "SHOPEE_LIVE_ADS_URL_BASE",
+    "https://seller.shopee.co.th/portal/marketing/pas/index",
 )
 DEFAULT_GROUP   = os.getenv("DEFAULT_GROUP", "kshomeaxie29")
 DATABASE_URL    = os.getenv("DATABASE_URL", "")
@@ -60,7 +60,30 @@ CONCURRENCY     = int(os.getenv("CONCURRENCY", "1"))     # local browser = seria
 NAV_TIMEOUT_MS  = int(os.getenv("NAV_TIMEOUT_MS", "30000"))
 LABEL_WAIT_MS   = int(os.getenv("LABEL_WAIT_MS",  "15000"))
 
+# Shopee dashboards use Bangkok time (UTC+7) for day boundaries.
+BKK_TZ = timezone(timedelta(hours=7))
+
 PROFILES_PATH = Path(__file__).parent / "profiles.json"
+
+
+def live_ads_url_for(target_date: str) -> str:
+    """Build the Live Ads URL for a specific YYYY-MM-DD (Bangkok time)."""
+    dt = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=BKK_TZ)
+    from_ts = int(dt.timestamp())
+    to_ts   = int((dt + timedelta(days=1)).timestamp()) - 1
+    return (f"{SHOPEE_LIVE_ADS_BASE}?type=live_stream_homepage"
+            f"&from={from_ts}&to={to_ts}&group=custom&offset=744")
+
+
+def affiliate_url_for(target_date: str) -> str:
+    """Try the dashboard with a ?date=YYYY-MM-DD param. Falls back to default."""
+    return f"{SHOPEE_AFFILIATE_URL_BASE}?date={target_date}"
+
+
+def default_target_date() -> str:
+    """Default target_date = YESTERDAY (Bangkok) — that's what the dashboard shows."""
+    now_bkk = datetime.now(BKK_TZ)
+    return (now_bkk - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -351,10 +374,21 @@ async def extract_shopee_data(page, profile_name: str = "x", debug: bool = False
     """
     result = {"commission": 0.0, "ads_cost": 0.0}
 
+    target_date = getattr(page, "_target_date", None)  # set by caller
+    affiliate_url = affiliate_url_for(target_date) if target_date else SHOPEE_AFFILIATE_URL_BASE
+    live_ads_url  = live_ads_url_for(target_date)  if target_date else live_ads_url_for(default_target_date())
+
+    # Format for the page's displayed date: DD-MM-YYYY
+    if target_date:
+        d = datetime.strptime(target_date, "%Y-%m-%d")
+        target_date_display = d.strftime("%d-%m-%Y")
+    else:
+        target_date_display = None
+
     # ───── 1. Commission (Affiliate Dashboard) ────────────────────────
     try:
-        print(f"  → goto {SHOPEE_AFFILIATE_URL}")
-        await page.goto(SHOPEE_AFFILIATE_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+        print(f"  → goto {affiliate_url}")
+        await page.goto(affiliate_url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except PWTimeout:
@@ -368,17 +402,37 @@ async def extract_shopee_data(page, profile_name: str = "x", debug: bool = False
         dbg_path = Path(__file__).parent / "debug" / f"{re.sub(r'[^A-Za-z0-9_-]','_',profile_name)}_affiliate_html.html" if debug else None
         if dbg_path:
             dbg_path.parent.mkdir(exist_ok=True)
-        # Note: KPI card uses "ค่าคอมมิชชั่นโดยประมาณ(฿)" with NO space before "(".
-        # The table header on the same page uses "ค่าคอมมิชชั่นโดยประมาณ (฿)" WITH a space.
-        # Including "(฿)" (no space) targets ONLY the KPI card.
-        result["commission"] = await _find_number_near_label(page, "ค่าคอมมิชชั่นโดยประมาณ(฿)", debug_dump_path=dbg_path)
+        # The dashboard ignores any ?date= URL param — it always shows the
+        # most-recent-completed-day data. Check what date is actually displayed
+        # so we don't double-write yesterday's commission under wrong dates.
+        displayed = None
+        try:
+            displayed = await page.evaluate(r"""
+                () => {
+                  const m = document.body.innerText.match(/(\d{2}-\d{2}-\d{4})/);
+                  return m ? m[1] : null;
+                }
+            """)
+        except Exception:
+            pass
+
+        if target_date_display and displayed and displayed != target_date_display:
+            print(f"  [skip] affiliate shows {displayed} but we wanted {target_date_display}; "
+                  f"commission=0 (date picker not implemented)")
+        else:
+            if displayed:
+                print(f"  [info] affiliate displaying: {displayed}")
+            # Note: KPI card uses 'ค่าคอมมิชชั่นโดยประมาณ(฿)' with NO space before '('.
+            # The table header on the same page uses '...(฿)' WITH a space.
+            # Including '(฿)' (no space) targets ONLY the KPI card.
+            result["commission"] = await _find_number_near_label(page, "ค่าคอมมิชชั่นโดยประมาณ(฿)", debug_dump_path=dbg_path)
         if debug and result["commission"] == 0.0:
             await _debug_dump(page, "affiliate", profile_name)
 
     # ───── 2. Ads Cost (Live Ads page) ────────────────────────────────
     try:
-        print(f"  → goto {SHOPEE_LIVE_ADS_URL}")
-        await page.goto(SHOPEE_LIVE_ADS_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+        print(f"  → goto {live_ads_url}")
+        await page.goto(live_ads_url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except PWTimeout:
@@ -490,6 +544,7 @@ async def scrape_one(playwright, profile, target_date, debug: bool = False) -> R
 
         ctx  = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        page._target_date = target_date  # consumed by extract_shopee_data()
 
         # 3. Extract data (returns 0 for failures — never raises)
         data = await extract_shopee_data(page, profile_name=name, debug=debug)
@@ -611,7 +666,10 @@ def run_parse_tests() -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Shopee Pipeline — local GoLogin scraper")
-    parser.add_argument("--target-date", default=datetime.now().strftime("%Y-%m-%d"))
+    parser.add_argument("--target-date", default=None,
+                        help="YYYY-MM-DD. Default: yesterday in Bangkok (the date the affiliate dashboard shows)")
+    parser.add_argument("--days", type=int, default=1,
+                        help="Scrape N consecutive days ending at --target-date (default 1)")
     parser.add_argument("--profiles", default=str(PROFILES_PATH))
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     parser.add_argument("--limit", type=int, default=0, help="Only scrape first N profiles")
@@ -619,6 +677,8 @@ def main():
     parser.add_argument("--test-parse", action="store_true", help="Run parse_thai_number tests and exit")
     parser.add_argument("--debug", action="store_true", help="Save screenshots + page text when labels not found")
     args = parser.parse_args()
+    if args.target_date is None:
+        args.target_date = default_target_date()
 
     if args.test_parse:
         sys.exit(0 if run_parse_tests() else 1)
@@ -640,28 +700,44 @@ def main():
     if args.limit > 0:
         profiles = profiles[:args.limit]
 
-    print(f"┌─ Shopee scrape · {args.target_date}")
+    # Build dates: end_date, end_date-1, ..., end_date-(days-1) — newest first
+    end_date  = datetime.strptime(args.target_date, "%Y-%m-%d").date()
+    date_list = [(end_date - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(args.days)]
+
+    print(f"┌─ Shopee scrape · {len(date_list)} day(s): {date_list[-1]} → {date_list[0]}")
     print(f"│  Profiles:        {len(profiles)}  (concurrency {args.concurrency})")
     print(f"│  Default group:   {DEFAULT_GROUP}")
     print(f"│  Profiles dir:    {GOLOGIN_PROFILES_DIR}")
-    print(f"│  Affiliate URL:   {SHOPEE_AFFILIATE_URL}")
-    print(f"│  Live Ads URL:    {SHOPEE_LIVE_ADS_URL}")
+    print(f"│  Affiliate URL:   {SHOPEE_AFFILIATE_URL_BASE}")
+    print(f"│  Live Ads base:   {SHOPEE_LIVE_ADS_BASE}")
     print(f"│  DB:              {'Supabase' if DATABASE_URL else 'NONE'}{'  [dry-run]' if args.dry_run else ''}")
     print(f"└─ Starting…")
 
     t0 = time.time()
-    results = asyncio.run(orchestrate(profiles, args.target_date, args.concurrency, debug=args.debug))
+    all_results = []
+    for d_idx, target_date in enumerate(date_list, 1):
+        print(f"\n═══ Day {d_idx}/{len(date_list)}: {target_date} ═══")
+        results = asyncio.run(orchestrate(profiles, target_date, args.concurrency, debug=args.debug))
+        all_results.extend(results)
+
+        success = sum(1 for r in results if r.status == "Success")
+        failed  = len(results) - success
+        print(f"Day {target_date}: {success} ok · {failed} fail")
+
+        # Write per day so a later failure doesn't lose earlier progress
+        if not args.dry_run and results:
+            n = write_results(results)
+            print(f"  Upserted {n} rows for {target_date}")
+
     dt = time.time() - t0
-
-    success = sum(1 for r in results if r.status == "Success")
-    failed  = len(results) - success
+    total_ok   = sum(1 for r in all_results if r.status == "Success")
+    total_fail = len(all_results) - total_ok
     print(f"\n═══════════════════════════════════════════════════════════")
-    print(f"Finished in {dt:.1f}s — {success} ok · {failed} fail "
-          f"({success / len(results) * 100:.1f}% success)")
+    print(f"Finished in {dt:.1f}s — {total_ok} ok · {total_fail} fail across {len(date_list)} day(s)")
 
-    if failed:
+    if total_fail:
         reasons = {}
-        for r in results:
+        for r in all_results:
             if r.status == "Failed":
                 reasons[r.error_reason] = reasons.get(r.error_reason, 0) + 1
         print("Failure breakdown:")
@@ -670,11 +746,9 @@ def main():
 
     if args.dry_run:
         print("\n--dry-run: skipping DB write")
-        for r in results:
-            print(f"  {r.profile_name:<20} commission={r.commission:<10} ads_cost={r.ads_cost}")
-    else:
-        n = write_results(results)
-        print(f"\nUpserted {n} rows to Supabase")
+        for r in all_results:
+            if r.status == "Success":
+                print(f"  {r.date} · {r.profile_name:<14} commission={r.commission:<8} ads_cost={r.ads_cost}")
 
 
 if __name__ == "__main__":
