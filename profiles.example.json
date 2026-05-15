@@ -1,14 +1,14 @@
 [
   {
-    "id": "gl_1000",
+    "id":   "GOLOGIN_PROFILE_ID_1",
     "name": "Shop-Bangkok-01"
   },
   {
-    "id": "gl_1001",
+    "id":   "GOLOGIN_PROFILE_ID_2",
     "name": "Shop-Bangkok-02"
   },
   {
-    "id": "gl_1002",
+    "id":   "GOLOGIN_PROFILE_ID_3",
     "name": "Shop-Bangkok-03"
   }
 ]

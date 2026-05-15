@@ -1,0 +1,6 @@
+# Local scraper dependencies (NOT deployed to Render).
+# Render only needs requirements.txt (dashboard/API).
+playwright>=1.40
+httpx>=0.25
+psycopg2-binary
+python-dotenv
