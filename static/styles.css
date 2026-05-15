@@ -376,6 +376,12 @@ body {
 }
 .tbl tfoot .sum-row td.num { font-family: var(--font-mono); }
 
+/* Group rows of the same channel together visually (mirrors spreadsheet) */
+.tbl tbody tr.group-start td {
+  border-top: 2px solid rgba(167, 139, 250, 0.18);
+}
+.tbl tbody tr.group-start:first-child td { border-top: none; }
+
 /* ─── Footer ──────────────────────────────────────────────────────────── */
 .tfoot {
   margin-top: 14px;

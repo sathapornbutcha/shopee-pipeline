@@ -179,11 +179,14 @@ async def get_data(date: str | None = None, group: str | None = None):
         params.append(group)
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    # Sort: channels alphabetical (so the same channel's days are contiguous),
+    # then date DESC (newest of that channel first). Matches the manual
+    # tracking spreadsheet layout the user is used to.
     c.execute(
         f"SELECT id, date, profile_name, open_channel_cost, ads_cost, "
         f"commission, account_group, scraped_at "
         f"FROM shopee_metrics {where} "
-        f"ORDER BY date DESC, profile_name ASC",
+        f"ORDER BY profile_name ASC, date DESC",
         params,
     )
 

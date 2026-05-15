@@ -256,7 +256,15 @@
       return;
     }
 
-    el.tbody.innerHTML = rows.map(rowHTML).join('');
+    // Mark the FIRST row of each profile group so CSS can draw a separator.
+    // Mirrors the manual spreadsheet layout where each channel's days are
+    // grouped together visually.
+    let lastProfile = null;
+    el.tbody.innerHTML = rows.map(r => {
+      const isFirstOfProfile = r.profile_name !== lastProfile;
+      lastProfile = r.profile_name;
+      return rowHTML(r, isFirstOfProfile);
+    }).join('');
 
     // Real-time sum row in <tfoot> — exact precision so totals match the table
     el.tfootSum.innerHTML = `
@@ -269,13 +277,13 @@
       </tr>`;
   }
 
-  function rowHTML(r) {
+  function rowHTML(r, isFirstOfProfile = false) {
     const initials = (r.profile_name || '?').slice(0, 2).toUpperCase();
     const grad = pickGradient(r.profile_name);
     const cost = (+r.open_channel_cost || 0) + (+r.ads_cost || 0);
     const net  = (+r.commission || 0) - cost;
     return `
-      <tr>
+      <tr class="${isFirstOfProfile ? 'group-start' : ''}">
         <td>
           <div class="profile">
             <div class="avatar" style="background:${grad}">${escapeHTML(initials)}</div>
