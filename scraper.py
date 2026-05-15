@@ -134,82 +134,136 @@ def parse_thai_number(text: str) -> float:
 #                          CORE EXTRACTOR (the headline function)
 # ════════════════════════════════════════════════════════════════════════════
 
-# Walk the DOM near a given label and return the closest visible numeric text.
-# Runs inside the page so it sees the same layout the user does.
+# Walk the DOM near a given label and return the closest numeric text.
+# The label may appear MULTIPLE times on the page (e.g. KPI card + table header).
+# For each occurrence, we walk up looking at siblings for a number — and pick
+# the occurrence whose number is CLOSEST in DOM tree distance.
 _FIND_NUMBER_NEAR_LABEL_JS = r"""
-(labelText) => {
-  // What "looks like a number" in this dashboard's locale
-  const NUM_RE = /^\s*[฿$]?\s*-?[\d,.]+\s*(พัน|หมื่น|แสน|ล้าน|k|K|m|M|b|B)?\s*$/u;
+([labelText, exactMatch]) => {
+  // Tags whose text content is code/markup, not user-visible data
+  const SKIP = new Set(['SCRIPT', 'NOSCRIPT', 'STYLE', 'IFRAME', 'CODE', 'TEMPLATE']);
 
-  const isVisible = (el) => {
-    if (!el) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) return false;
-    const cs = window.getComputedStyle(el);
-    return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+  // Either: (a) a number WITH a Thai/Western multiplier suffix, OR
+  //         (b) a plain number not followed by another digit/dot or by '%'.
+  const NUM_RE = /(?:-?\d[\d,]*(?:\.\d+)?\s*(?:พัน|หมื่น|แสน|ล้าน|k|K|m|M|b|B)|-?\d[\d,]*(?:\.\d+)?(?![.\d]|\s*%))/u;
+
+  // Every element whose text matches the label is a candidate.
+  // exactMatch=true ⇒ element's trimmed textContent must EQUAL the label
+  //                   (so 'ค่าโฆษณา' does NOT match 'ค่าโฆษณาวันนี้').
+  // exactMatch=false ⇒ substring match (more permissive).
+  const isInSkippedTree = (el) => {
+    let p = el;
+    while (p) { if (SKIP.has(p.tagName)) return true; p = p.parentElement; }
+    return false;
   };
-
-  // 1) Find the deepest element whose OWN text contains the label.
-  //    (Deepest = the actual UI label, not a wrapping container.)
   const all = Array.from(document.querySelectorAll('body *'));
-  const labelEls = all.filter(el => {
-    if (!isVisible(el)) return false;
-    const own = Array.from(el.childNodes)
-      .filter(n => n.nodeType === Node.TEXT_NODE)
-      .map(n => n.textContent).join('').trim();
-    return own && own.includes(labelText);
+  const candidates = all.filter(el => {
+    if (isInSkippedTree(el)) return false;
+    if (!el.textContent) return false;
+    if (exactMatch) return el.textContent.trim() === labelText;
+    return el.textContent.includes(labelText);
   });
-  if (!labelEls.length) return null;
+  if (!candidates.length) return null;
 
-  // Pick the deepest match
-  labelEls.sort((a, b) => {
-    const depth = (n) => { let d = 0; while (n) { d++; n = n.parentElement; } return d; };
-    return depth(b) - depth(a);
-  });
-  const labelEl = labelEls[0];
+  // Try DEEPEST candidates first — they're the most specific (smallest wrapper
+  // around just the label). The shallow ones are page-wide wrappers and
+  // their "siblings" are unrelated to the label.
+  const depth = (n) => { let d = 0; while (n) { d++; n = n.parentElement; } return d; };
+  candidates.sort((a, b) => depth(b) - depth(a));
 
-  const isNumeric = (txt) => {
-    if (!txt) return false;
-    const t = txt.trim();
-    if (!t || t.length > 30) return false;
-    return NUM_RE.test(t);
+  const findNumberIn = (txt) => {
+    if (!txt) return null;
+    const cleaned = txt.split(labelText).join('').trim();
+    if (!cleaned || cleaned.length > 200) return null;
+    // Skip digit-reel widgets (animated counters with all 10 digits stacked).
+    const distinct = new Set(cleaned.replace(/[^\d]/g, '').split(''));
+    if (distinct.size > 6) return null;
+    // Skip descriptive Thai text (tooltips, captions) — a value sibling has
+    // little to no Thai prose around the number.
+    const thaiCount = (cleaned.match(/[฀-๿]/g) || []).length;
+    if (thaiCount > 10) return null;
+    const m = cleaned.match(NUM_RE);
+    return m ? m[0].trim() : null;
   };
 
-  // 2) Check direct siblings of the label
-  if (labelEl.parentElement) {
-    for (const sib of labelEl.parentElement.children) {
-      if (sib === labelEl) continue;
-      if (!isVisible(sib)) continue;
-      const txt = sib.textContent.trim();
-      if (isNumeric(txt)) return txt;
+  // For each candidate, walk up. Track the shallowest level at which a
+  // number is found across ALL candidates — that's the winner.
+  let bestNum = null;
+  let bestLevel = Infinity;
+
+  for (const labelEl of candidates) {
+    let current = labelEl;
+    for (let level = 0; level < 6 && level < bestLevel; level++) {
+      const parent = current.parentElement;
+      if (!parent) break;
+      let foundAtLevel = null;
+      for (const sib of parent.children) {
+        if (sib === current) continue;
+        if (sib.contains(labelEl)) continue;
+        if (SKIP.has(sib.tagName)) continue;            // ignore <script>/<noscript> siblings
+        const num = findNumberIn(sib.textContent);
+        if (num !== null) { foundAtLevel = num; break; }
+      }
+      if (foundAtLevel !== null) {
+        if (level < bestLevel) {
+          bestLevel = level;
+          bestNum = foundAtLevel;
+        }
+        break;
+      }
+      current = parent;
     }
+    if (bestLevel === 0) break;
   }
 
-  // 3) Walk up to 5 ancestors; for each, scan its descendants
-  let ancestor = labelEl.parentElement;
-  for (let depth = 0; depth < 5 && ancestor; depth++) {
-    for (const child of ancestor.querySelectorAll('*')) {
-      if (child === labelEl) continue;
-      if (child.contains(labelEl) || labelEl.contains(child)) continue;
-      if (!isVisible(child)) continue;
-      const txt = child.textContent.trim();
-      if (isNumeric(txt)) return txt;
-    }
-    ancestor = ancestor.parentElement;
-  }
-
-  return null;
+  return bestNum;
 }
 """
 
 
-async def _find_number_near_label(page, label_text: str, timeout_ms: int = LABEL_WAIT_MS) -> float:
+_DUMP_NEAR_JS = r"""
+([labelText, exactMatch]) => {
+  const all = Array.from(document.querySelectorAll('body *'));
+  const labelEls = all.filter(el => {
+    if (!el.textContent) return false;
+    if (exactMatch) return el.textContent.trim() === labelText;
+    return el.textContent.includes(labelText);
+  });
+  if (!labelEls.length) return JSON.stringify({error: 'no candidates'});
+  const depth = (n) => { let d = 0; while (n) { d++; n = n.parentElement; } return d; };
+  const out = [];
+  for (let i = 0; i < Math.min(labelEls.length, 6); i++) {
+    const el = labelEls[i];
+    // Get the parent's outerHTML (limited) and direct sibling text content
+    const parent = el.parentElement;
+    const siblingTexts = parent ? Array.from(parent.children).map(c => ({
+      tag: c.tagName, isLabel: c === el, text: (c.textContent || '').trim().slice(0, 100)
+    })) : [];
+    out.push({
+      idx: i,
+      depth: depth(el),
+      tag: el.tagName,
+      classes: el.className,
+      ownText: Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim().slice(0, 120),
+      parentTag: parent ? parent.tagName : null,
+      parentClass: parent ? parent.className : null,
+      siblings: siblingTexts,
+    });
+  }
+  return JSON.stringify({count: labelEls.length, candidates: out}, null, 2);
+}
+"""
+
+async def _find_number_near_label(page, label_text: str, timeout_ms: int = LABEL_WAIT_MS, debug_dump_path=None, exact: bool = False) -> float:
     """
     Wait for `label_text` to appear, then return the nearest numeric value
     as a float. Returns 0.0 on any failure.
+
+    exact=True: only match elements whose text equals the label EXACTLY
+                (prevents 'ค่าโฆษณา' from matching 'ค่าโฆษณาวันนี้').
     """
     try:
-        loc = page.get_by_text(label_text, exact=False).first
+        loc = page.get_by_text(label_text, exact=exact).first
         await loc.wait_for(state="visible", timeout=timeout_ms)
     except PWTimeout:
         print(f"  [warn] label '{label_text}' did not appear within {timeout_ms}ms")
@@ -219,10 +273,20 @@ async def _find_number_near_label(page, label_text: str, timeout_ms: int = LABEL
         return 0.0
 
     try:
-        raw = await page.evaluate(_FIND_NUMBER_NEAR_LABEL_JS, label_text)
+        raw = await page.evaluate(_FIND_NUMBER_NEAR_LABEL_JS, [label_text, exact])
     except Exception as e:
         print(f"  [warn] DOM walk failed for '{label_text}': {e}")
         return 0.0
+
+    # Always dump candidate info when debug path is set — helps tune the algorithm
+    if debug_dump_path is not None:
+        try:
+            html = await page.evaluate(_DUMP_NEAR_JS, [label_text, exact])
+            if html:
+                Path(debug_dump_path).write_text(html, encoding="utf-8")
+                print(f"  [debug] candidate dump saved → {debug_dump_path}")
+        except Exception:
+            pass
 
     if raw is None:
         print(f"  [warn] '{label_text}' found but no numeric value nearby")
@@ -233,7 +297,36 @@ async def _find_number_near_label(page, label_text: str, timeout_ms: int = LABEL
     return value
 
 
-async def extract_shopee_data(page) -> dict:
+async def _debug_dump(page, tag: str, profile_name: str) -> None:
+    """Save page title + visible text + viewport screenshot to help diagnose label misses."""
+    debug_dir = Path(__file__).parent / "debug"
+    debug_dir.mkdir(exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", profile_name)
+    png  = debug_dir / f"{safe}_{tag}.png"
+    txt  = debug_dir / f"{safe}_{tag}.txt"
+
+    # Always-on: dump URL + title + visible text (cheap, ~no timeout risk)
+    try:
+        url   = page.url
+        title = await page.title()
+        body  = (await page.locator("body").inner_text())[:5000]
+        txt.write_text(
+            f"URL:   {url}\nTITLE: {title}\n\n--- BODY (first 5000 chars) ---\n{body}",
+            encoding="utf-8",
+        )
+        print(f"  [debug] saved {txt.name}")
+    except Exception as e:
+        print(f"  [debug] text dump failed: {e}")
+
+    # Best-effort: viewport screenshot with short timeout
+    try:
+        await page.screenshot(path=str(png), full_page=False, timeout=8000)
+        print(f"  [debug] saved {png.name}")
+    except Exception as e:
+        print(f"  [debug] screenshot skipped: {type(e).__name__}")
+
+
+async def extract_shopee_data(page, profile_name: str = "x", debug: bool = False) -> dict:
     """
     Extract two metrics from the Shopee Affiliate platform.
 
@@ -252,6 +345,9 @@ async def extract_shopee_data(page) -> dict:
       - label not found on page    → that metric = 0
       - number can't be parsed     → that metric = 0
     Never raises.
+
+    If debug=True, saves a full-page screenshot + page text snapshot to ./debug/
+    whenever a label is not found — so you can see what the page actually showed.
     """
     result = {"commission": 0.0, "ads_cost": 0.0}
 
@@ -259,26 +355,48 @@ async def extract_shopee_data(page) -> dict:
     try:
         print(f"  → goto {SHOPEE_AFFILIATE_URL}")
         await page.goto(SHOPEE_AFFILIATE_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-        # Some pages render KPIs lazily — give them a moment
-        await page.wait_for_load_state("networkidle", timeout=8000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except PWTimeout:
+            pass  # some SPA pages never go idle — that's fine, we'll still try
+        print(f"  [info] landed on: {page.url}  · title: {(await page.title())[:80]}")
     except PWTimeout:
         print(f"  [warn] affiliate page nav timeout")
     except Exception as e:
         print(f"  [warn] affiliate nav: {type(e).__name__}: {e}")
     else:
-        result["commission"] = await _find_number_near_label(page, "ค่าคอมมิชชันโดยประมาณ")
+        dbg_path = Path(__file__).parent / "debug" / f"{re.sub(r'[^A-Za-z0-9_-]','_',profile_name)}_affiliate_html.html" if debug else None
+        if dbg_path:
+            dbg_path.parent.mkdir(exist_ok=True)
+        # Note: KPI card uses "ค่าคอมมิชชั่นโดยประมาณ(฿)" with NO space before "(".
+        # The table header on the same page uses "ค่าคอมมิชชั่นโดยประมาณ (฿)" WITH a space.
+        # Including "(฿)" (no space) targets ONLY the KPI card.
+        result["commission"] = await _find_number_near_label(page, "ค่าคอมมิชชั่นโดยประมาณ(฿)", debug_dump_path=dbg_path)
+        if debug and result["commission"] == 0.0:
+            await _debug_dump(page, "affiliate", profile_name)
 
     # ───── 2. Ads Cost (Live Ads page) ────────────────────────────────
     try:
         print(f"  → goto {SHOPEE_LIVE_ADS_URL}")
         await page.goto(SHOPEE_LIVE_ADS_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle", timeout=8000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except PWTimeout:
+            pass
+        print(f"  [info] landed on: {page.url}  · title: {(await page.title())[:80]}")
     except PWTimeout:
         print(f"  [warn] live-ads page nav timeout")
     except Exception as e:
         print(f"  [warn] live-ads nav: {type(e).__name__}: {e}")
     else:
-        result["ads_cost"] = await _find_number_near_label(page, "ค่าโฆษณา")
+        # 'ค่าโฆษณา' appears multiple times (Today's ad cost, tab, column header, KPI).
+        # exact=True ensures we only match the KPI label, not 'ค่าโฆษณาวันนี้'.
+        dbg_path2 = Path(__file__).parent / "debug" / f"{re.sub(r'[^A-Za-z0-9_-]','_',profile_name)}_liveads_html.html" if debug else None
+        if dbg_path2:
+            dbg_path2.parent.mkdir(exist_ok=True)
+        result["ads_cost"] = await _find_number_near_label(page, "ค่าโฆษณา", exact=True, debug_dump_path=dbg_path2)
+        if debug and result["ads_cost"] == 0.0:
+            await _debug_dump(page, "liveads", profile_name)
 
     return result
 
@@ -333,7 +451,7 @@ class Result:
     duration_ms:       int = 0
 
 
-async def scrape_one(playwright, profile, target_date) -> Result:
+async def scrape_one(playwright, profile, target_date, debug: bool = False) -> Result:
     pid   = profile["id"]
     name  = profile.get("name", pid)
     group = profile.get("group", DEFAULT_GROUP)
@@ -374,7 +492,7 @@ async def scrape_one(playwright, profile, target_date) -> Result:
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
         # 3. Extract data (returns 0 for failures — never raises)
-        data = await extract_shopee_data(page)
+        data = await extract_shopee_data(page, profile_name=name, debug=debug)
         res.commission = data["commission"]
         res.ads_cost   = data["ads_cost"]
         res.status     = "Success"
@@ -402,13 +520,13 @@ async def scrape_one(playwright, profile, target_date) -> Result:
 #                          Orchestrator
 # ════════════════════════════════════════════════════════════════════════════
 
-async def orchestrate(profiles, target_date, concurrency):
+async def orchestrate(profiles, target_date, concurrency, debug: bool = False):
     sem = asyncio.Semaphore(concurrency)
 
     async with async_playwright() as pw:
         async def run(profile):
             async with sem:
-                return await scrape_one(pw, profile, target_date)
+                return await scrape_one(pw, profile, target_date, debug=debug)
 
         return await asyncio.gather(*(run(p) for p in profiles))
 
@@ -499,6 +617,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Only scrape first N profiles")
     parser.add_argument("--dry-run", action="store_true", help="Scrape but don't write")
     parser.add_argument("--test-parse", action="store_true", help="Run parse_thai_number tests and exit")
+    parser.add_argument("--debug", action="store_true", help="Save screenshots + page text when labels not found")
     args = parser.parse_args()
 
     if args.test_parse:
@@ -531,7 +650,7 @@ def main():
     print(f"└─ Starting…")
 
     t0 = time.time()
-    results = asyncio.run(orchestrate(profiles, args.target_date, args.concurrency))
+    results = asyncio.run(orchestrate(profiles, args.target_date, args.concurrency, debug=args.debug))
     dt = time.time() - t0
 
     success = sum(1 for r in results if r.status == "Success")
