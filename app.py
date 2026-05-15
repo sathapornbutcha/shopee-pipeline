@@ -20,6 +20,7 @@ STATIC_PATH = Path(__file__).parent / "static"
 DB_PATH = Path(__file__).parent / "shopee_data.db"
 
 USE_PG = bool(DATABASE_URL)
+_startup_error: str = ""
 
 # ─── DB helpers ──────────────────────────────────────────────────────────────
 
@@ -150,12 +151,13 @@ def seed_mock_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global USE_PG, DATABASE_URL, _startup_error
     try:
         init_db()
         seed_mock_data()
     except Exception as e:
+        _startup_error = str(e)
         print(f"[startup] DB init warning: {e} — falling back to SQLite")
-        global USE_PG, DATABASE_URL
         USE_PG = False
         DATABASE_URL = ""
         init_db()
@@ -170,7 +172,7 @@ app = FastAPI(title="Shopee Pipeline Dashboard", lifespan=lifespan)
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "db": "postgresql" if USE_PG else "sqlite"}
+    return {"ok": True, "db": "postgresql" if USE_PG else "sqlite", "err": _startup_error or None}
 
 
 @app.get("/api/data")
