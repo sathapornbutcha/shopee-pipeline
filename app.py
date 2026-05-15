@@ -172,7 +172,14 @@ app = FastAPI(title="Shopee Pipeline Dashboard", lifespan=lifespan)
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "db": "postgresql" if USE_PG else "sqlite", "err": _startup_error or None}
+    raw_url = os.getenv("DATABASE_URL", "")
+    return {
+        "ok": True,
+        "db": "postgresql" if USE_PG else "sqlite",
+        "err": _startup_error or None,
+        "has_db_url": bool(raw_url),
+        "url_prefix": raw_url[:25] if raw_url else None,
+    }
 
 
 @app.get("/api/data")
