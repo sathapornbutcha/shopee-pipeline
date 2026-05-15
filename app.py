@@ -150,8 +150,16 @@ def seed_mock_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    seed_mock_data()
+    try:
+        init_db()
+        seed_mock_data()
+    except Exception as e:
+        print(f"[startup] DB init warning: {e} — falling back to SQLite")
+        global USE_PG, DATABASE_URL
+        USE_PG = False
+        DATABASE_URL = ""
+        init_db()
+        seed_mock_data()
     yield
 
 
