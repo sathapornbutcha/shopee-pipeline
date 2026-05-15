@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="th">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -16,7 +16,7 @@
       <div class="brand-mark">S</div>
       <div class="brand-text">
         <h1>Shopee Pipeline</h1>
-        <p>GoLogin × Playwright · 400-profile orchestrator</p>
+        <p>GoLogin × Playwright · Multi-channel orchestrator</p>
       </div>
     </div>
     <div class="spacer"></div>
@@ -32,15 +32,9 @@
       </svg>
       Refresh
     </button>
-    <button class="btn btn-primary">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/>
-      </svg>
-      Run Batch
-    </button>
   </div>
 
-  <!-- ── KPI cards ──────────────────────────────────────────────────── -->
+  <!-- ── KPI cards (computed real-time from rows) ───────────────────── -->
   <div class="kpi-row">
     <div class="kpi cyan">
       <div class="label">
@@ -50,13 +44,27 @@
             <circle cx="12" cy="7" r="4"/>
           </svg>
         </span>
-        Profiles Today
+        ช่องทั้งหมด
       </div>
-      <div class="value" id="kpiTotal">0</div>
-      <div class="sub" id="kpiTotalSub">—</div>
+      <div class="value" id="kpiProfiles">0</div>
+      <div class="sub" id="kpiProfilesSub">— กลุ่ม</div>
     </div>
 
     <div class="kpi sun">
+      <div class="label">
+        <span class="ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="6" width="18" height="12" rx="2"/>
+            <path d="M3 10h18"/>
+          </svg>
+        </span>
+        เปิดช่อง (รวม)
+      </div>
+      <div class="value" id="kpiOpen">฿0</div>
+      <div class="sub" id="kpiOpenSub">—</div>
+    </div>
+
+    <div class="kpi violet">
       <div class="label">
         <span class="ico">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -64,25 +72,28 @@
             <path d="M12 7v10 M9 10c0-1.3 1.3-2 3-2s3 .7 3 2-1.3 2-3 2-3 .7-3 2 1.3 2 3 2 3-.7 3-2"/>
           </svg>
         </span>
-        Total Ads Cost
+        คอยน์ + แอด (รวม)
       </div>
-      <div class="value" id="kpiCost">฿0</div>
-      <div class="sub">sum of successful runs</div>
+      <div class="value" id="kpiAds">฿0</div>
+      <div class="sub" id="kpiAdsSub">—</div>
     </div>
 
-    <div class="kpi violet">
+    <div class="kpi mint">
       <div class="label">
         <span class="ico">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 2l3 7 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1z"/>
           </svg>
         </span>
-        Est. Commission
+        ค่าคอมมิชชัน (รวม)
       </div>
       <div class="value" id="kpiComm">฿0</div>
       <div class="sub" id="kpiCommSub">—</div>
     </div>
+  </div>
 
+  <!-- ── Secondary KPI: Net Profit ──────────────────────────────────── -->
+  <div class="kpi-row" style="grid-template-columns: 1fr 1fr 1fr;">
     <div class="kpi mint">
       <div class="label">
         <span class="ico">
@@ -90,38 +101,62 @@
             <path d="M3 17l6-6 4 4 8-8 M21 7h-5 M21 7v5"/>
           </svg>
         </span>
-        Average ROAS
+        กำไรสุทธิ (commission − ต้นทุน)
+      </div>
+      <div class="value" id="kpiNet">฿0</div>
+      <div class="sub" id="kpiNetSub">—</div>
+    </div>
+    <div class="kpi cyan">
+      <div class="label">
+        <span class="ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 20V10 M18 20V4 M6 20v-4"/>
+          </svg>
+        </span>
+        ROAS เฉลี่ย
       </div>
       <div class="value" id="kpiRoas">0.00×</div>
-      <div class="sub" id="kpiRoasSub">—</div>
+      <div class="sub" id="kpiRoasSub">commission ÷ ต้นทุน</div>
+    </div>
+    <div class="kpi sun">
+      <div class="label">
+        <span class="ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </span>
+        กลุ่มบัญชี
+      </div>
+      <div class="value" id="kpiGroups">0</div>
+      <div class="sub">กำลังแสดงผล</div>
     </div>
   </div>
 
   <!-- ── Filter bar ─────────────────────────────────────────────────── -->
   <div class="filterbar">
-    <span class="filter-label">DATE</span>
+    <span class="filter-label">วันที่</span>
     <span class="field">
       <select id="filterDate">
-        <option value="all">All dates</option>
+        <option value="all">ทุกวัน</option>
       </select>
     </span>
 
-    <span class="filter-label" style="margin-left: 8px">STATUS</span>
-    <div class="seg" id="segStatus" role="tablist">
-      <button data-value="all"      aria-pressed="true">All</button>
-      <button data-value="Success"  class="seg-success" aria-pressed="false">Success</button>
-      <button data-value="Failed"   class="seg-fail"    aria-pressed="false">Failed</button>
-    </div>
+    <span class="filter-label" style="margin-left: 8px">กลุ่มบัญชี</span>
+    <span class="field">
+      <select id="filterGroup">
+        <option value="all">ทุกกลุ่ม</option>
+      </select>
+    </span>
 
-    <input id="searchInput" class="search-input" placeholder="Search profile name or ID…" />
+    <input id="searchInput" class="search-input" placeholder="ค้นหาชื่อช่อง…" />
   </div>
 
   <!-- ── Data table ─────────────────────────────────────────────────── -->
   <div class="data-card">
     <header>
       <div>
-        <h2>Latest Extractions</h2>
-        <div class="hint">Newest scrape result per row. Click a row to drill in (coming soon).</div>
+        <h2>ข้อมูลรายช่อง (Raw)</h2>
+        <div class="hint">ข้อมูลดิบจาก Supabase — ผลรวมคำนวณบนหน้าเว็บแบบ Real-time</div>
       </div>
       <span class="badge muted" id="rowCount">0 rows</span>
     </header>
@@ -129,23 +164,24 @@
     <table class="tbl">
       <thead>
         <tr>
-          <th>Profile</th>
-          <th>Date</th>
-          <th class="num">Ads Cost</th>
-          <th class="num">Est. Commission</th>
-          <th class="num">ROAS</th>
-          <th>Status</th>
-          <th class="num">Duration</th>
+          <th>ช่อง</th>
+          <th>วันที่</th>
+          <th>กลุ่ม</th>
+          <th class="num">เปิดช่อง</th>
+          <th class="num">คอยน์ + แอด</th>
+          <th class="num">คอมมิชชัน</th>
+          <th class="num">กำไร</th>
         </tr>
       </thead>
       <tbody id="tbody">
         <tr><td colspan="7" class="empty"><span class="spinner"></span> Loading…</td></tr>
       </tbody>
+      <tfoot id="tfootSum"></tfoot>
     </table>
 
     <div class="tfoot">
       <span id="lastSync">—</span>
-      <span>Powered by FastAPI · SQLite</span>
+      <span>Powered by FastAPI · Supabase</span>
     </div>
   </div>
 </div>

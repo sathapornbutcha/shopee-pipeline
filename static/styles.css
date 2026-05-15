@@ -364,6 +364,18 @@ body {
   margin-top: 3px;
 }
 
+.pos { color: #0f8b5c; }
+.neg { color: #c44261; }
+.dim { color: var(--dim); font-family: var(--font-mono); font-size: 11px; }
+
+.tbl tfoot .sum-row td {
+  padding: 14px;
+  background: rgba(167, 139, 250, 0.08);
+  border-top: 1.5px solid var(--hairline);
+  font-size: 13px;
+}
+.tbl tfoot .sum-row td.num { font-family: var(--font-mono); }
+
 /* ─── Footer ──────────────────────────────────────────────────────────── */
 .tfoot {
   margin-top: 14px;

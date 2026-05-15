@@ -1,83 +1,84 @@
 /* ──────────────────────────────────────────────────────────────────────────
    Shopee Pipeline Dashboard — vanilla JS controller.
-   Fetches /api/data + /api/summary; falls back to mock data when the API is
-   unreachable (e.g. opening this file directly with file://) so the UI is
-   always inspectable.
+   All aggregations (totals, ROAS, net profit) are computed CLIENT-SIDE from
+   raw rows returned by /api/data — the DB never stores totals.
    ────────────────────────────────────────────────────────────────────────── */
 (function () {
   'use strict';
 
-  // ─── Mock fallback ───────────────────────────────────────────────────
+  // ─── Mock fallback (so the page is inspectable even without an API) ────
   const MOCK = (() => {
     const today = new Date().toISOString().slice(0, 10);
-    const y = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-    const names = [
-      'Shop-Bangkok-01','Shop-Bangkok-02','Shop-Bangkok-03','Shop-CNX-01',
-      'Shop-CNX-02','Shop-HCMC-01','Shop-HCMC-02','Shop-Jakarta-01',
-      'Shop-KL-01','Shop-KL-02','Shop-Manila-01','Shop-Manila-02',
-      'Shop-Singapore-01','Shop-HoChiMinh-03','Shop-Bandung-01','Shop-Surabaya-01',
+    const y     = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const tpl   = [
+      ['lonaharper',  'kshomeaxie29',  320, 1250, 2840],
+      ['kingmolly',   'kshomeaxie29',  180,  890, 1620],
+      ['amelia_shop', 'kshomeaxie29',  250, 1480, 3210],
+      ['jayden_th',   'vinhomeaxie44', 120,  780, 1140],
+      ['noah_market', 'vinhomeaxie44', 300, 1340, 2890],
+      ['emma_th',     'vinhomeaxie44', 200, 1020, 1980],
+      ['oliver_pro',  'homestore_a1',  400, 1820, 4120],
+      ['liam_shop',   'homestore_a1',  220,  990, 2230],
     ];
-    return names.map((n, i) => {
-      const failed = i % 5 === 1 || i % 7 === 0;
-      const reasons = ['captcha','nav_timeout','otp','hard_timeout','no_metrics'];
-      const reason = failed ? reasons[i % reasons.length] : null;
-      const cost = 1200 + Math.random() * 9200;
-      const comm = cost * (0.6 + Math.random() * 0.6);
-      const roas = comm / cost;
-      return {
-        id: 1000 - i,
-        profile_id: 'gl_' + (1000 + i),
-        profile_name: n,
-        target_date: i < 3 ? y : today,
-        scraped_at: new Date(Date.now() - i * 60000).toISOString(),
-        ads_cost:       failed ? null : +cost.toFixed(2),
-        est_commission: failed ? null : +comm.toFixed(2),
-        roas:           failed ? null : +roas.toFixed(2),
-        status:       failed ? 'Failed' : 'Success',
-        error_reason: reason,
-        error_detail: reason ? `${reason} detected on dashboard` : null,
-        duration_ms:  failed ? 15000 + Math.floor(Math.random() * 3000) : 2000 + Math.floor(Math.random() * 4000),
-      };
-    });
+    const rows = [];
+    let id = 1;
+    for (const d of [today, y]) {
+      for (const [name, grp, openc, ads, comm] of tpl) {
+        rows.push({
+          id: id++,
+          date: d,
+          profile_name: name,
+          account_group: grp,
+          open_channel_cost: openc,
+          ads_cost: ads,
+          commission: comm,
+          scraped_at: new Date().toISOString(),
+        });
+      }
+    }
+    return rows;
   })();
 
-  // ─── State ───────────────────────────────────────────────────────────
+  // ─── State ─────────────────────────────────────────────────────────────
   const state = {
     rows: [],
-    summary: null,
-    filterDate: 'all',
-    filterStatus: 'all',
+    filterDate:  'all',
+    filterGroup: 'all',
     filterQuery: '',
-    apiUp: null, // null=unknown, true/false
+    apiUp: null,
     loading: false,
   };
 
-  // ─── DOM ─────────────────────────────────────────────────────────────
-  const $ = (sel) => document.querySelector(sel);
+  // ─── DOM ───────────────────────────────────────────────────────────────
+  const $ = (s) => document.querySelector(s);
   const el = {
     statusPill: $('#statusPill'),
     statusText: $('#statusText'),
     dateSel:    $('#filterDate'),
-    seg:        $('#segStatus'),
+    groupSel:   $('#filterGroup'),
     search:     $('#searchInput'),
     refresh:    $('#refreshBtn'),
     tbody:      $('#tbody'),
+    tfootSum:   $('#tfootSum'),
     rowCount:   $('#rowCount'),
     lastSync:   $('#lastSync'),
-    // KPIs
-    kpiTotal:    $('#kpiTotal'),
-    kpiTotalSub: $('#kpiTotalSub'),
-    kpiCost:     $('#kpiCost'),
-    kpiComm:     $('#kpiComm'),
-    kpiCommSub:  $('#kpiCommSub'),
-    kpiRoas:     $('#kpiRoas'),
-    kpiRoasSub:  $('#kpiRoasSub'),
+    kpiProfiles:    $('#kpiProfiles'),
+    kpiProfilesSub: $('#kpiProfilesSub'),
+    kpiOpen:        $('#kpiOpen'),
+    kpiOpenSub:     $('#kpiOpenSub'),
+    kpiAds:         $('#kpiAds'),
+    kpiAdsSub:      $('#kpiAdsSub'),
+    kpiComm:        $('#kpiComm'),
+    kpiCommSub:     $('#kpiCommSub'),
+    kpiNet:         $('#kpiNet'),
+    kpiNetSub:      $('#kpiNetSub'),
+    kpiRoas:        $('#kpiRoas'),
+    kpiRoasSub:     $('#kpiRoasSub'),
+    kpiGroups:      $('#kpiGroups'),
   };
 
-  // ─── Fetch helpers ───────────────────────────────────────────────────
-  const API_BASE = ''; // same origin
-
-  async function fetchJSON(url, ms = 2500) {
+  // ─── Fetch helpers ─────────────────────────────────────────────────────
+  async function fetchJSON(url, ms = 4000) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), ms);
     try {
@@ -88,10 +89,8 @@
   }
 
   async function probe() {
-    try {
-      await fetchJSON(API_BASE + '/api/health');
-      state.apiUp = true;
-    } catch { state.apiUp = false; }
+    try { await fetchJSON('/api/health'); state.apiUp = true; }
+    catch { state.apiUp = false; }
     setApiStatus();
   }
 
@@ -108,24 +107,21 @@
     }
   }
 
-  // ─── Load ────────────────────────────────────────────────────────────
+  // ─── Load ──────────────────────────────────────────────────────────────
   async function load() {
     state.loading = true;
-    render(); // shows the spinner
+    render();
 
     if (state.apiUp) {
       try {
-        const params = new URLSearchParams();
-        if (state.filterDate !== 'all')   params.set('date',   state.filterDate);
-        if (state.filterStatus !== 'all') params.set('status', state.filterStatus);
-        const [rows, summary, dates] = await Promise.all([
-          fetchJSON(API_BASE + '/api/data?' + params.toString(), 6000),
-          fetchJSON(API_BASE + '/api/summary' + (state.filterDate !== 'all' ? `?date=${state.filterDate}` : ''), 4000),
-          fetchJSON(API_BASE + '/api/dates', 4000),
+        const [rows, dates, groups] = await Promise.all([
+          fetchJSON('/api/data', 8000),
+          fetchJSON('/api/dates', 4000),
+          fetchJSON('/api/groups', 4000),
         ]);
         state.rows = rows;
-        state.summary = summary;
         populateDates(dates);
+        populateGroups(groups);
       } catch (e) {
         console.warn('API error, falling back to mock:', e);
         state.apiUp = false;
@@ -142,81 +138,95 @@
 
   function useMock() {
     state.rows = MOCK.slice();
-    // derive summary from MOCK + filters
-    const today = new Date().toISOString().slice(0, 10);
-    const date = state.filterDate === 'all' ? today : state.filterDate;
-    const onDate = MOCK.filter(r => r.target_date === date);
-    const success = onDate.filter(r => r.status === 'Success');
-    const failed  = onDate.filter(r => r.status === 'Failed');
-    const total_cost       = success.reduce((s, r) => s + (r.ads_cost || 0), 0);
-    const total_commission = success.reduce((s, r) => s + (r.est_commission || 0), 0);
-    const avg_roas         = success.length
-      ? success.reduce((s, r) => s + (r.roas || 0), 0) / success.length : 0;
-    state.summary = {
-      target_date: date,
-      total: onDate.length,
-      success: success.length,
-      failed: failed.length,
-      success_rate: onDate.length ? +(success.length / onDate.length * 100).toFixed(1) : 0,
-      total_cost,
-      total_commission,
-      avg_roas,
-    };
-    const allDates = [...new Set(MOCK.map(r => r.target_date))].sort().reverse();
-    populateDates(allDates);
+    populateDates([...new Set(MOCK.map(r => r.date))].sort().reverse());
+    populateGroups([...new Set(MOCK.map(r => r.account_group))].sort());
   }
 
   function populateDates(dates) {
     const cur = el.dateSel.value || 'all';
-    el.dateSel.innerHTML = '<option value="all">All dates</option>' +
+    el.dateSel.innerHTML = '<option value="all">ทุกวัน</option>' +
       dates.map(d => `<option value="${d}"${d === cur ? ' selected' : ''}>${d}</option>`).join('');
-    if ([...el.dateSel.options].some(o => o.value === cur)) el.dateSel.value = cur;
   }
 
-  // ─── Render ──────────────────────────────────────────────────────────
-  function render() {
-    renderKPIs();
-    renderTable();
-    el.lastSync.textContent = 'Last sync ' + new Date().toLocaleTimeString();
+  function populateGroups(groups) {
+    const cur = el.groupSel.value || 'all';
+    el.groupSel.innerHTML = '<option value="all">ทุกกลุ่ม</option>' +
+      groups.map(g => `<option value="${escapeHTML(g)}"${g === cur ? ' selected' : ''}>${escapeHTML(g)}</option>`).join('');
   }
 
-  function renderKPIs() {
-    const s = state.summary || {};
-    el.kpiTotal.textContent    = (s.total ?? 0).toLocaleString();
-    el.kpiTotalSub.innerHTML   = `
-      <span class="delta up">${s.success ?? 0} ok</span>
-      <span class="delta down">${s.failed ?? 0} fail</span>
-      <span>· ${s.success_rate ?? 0}% success</span>`;
-    el.kpiCost.textContent     = fmtMoney(s.total_cost);
-    el.kpiComm.textContent     = fmtMoney(s.total_commission);
-    el.kpiCommSub.innerHTML    = s.total_cost
-      ? `<span class="delta up">${(((s.total_commission / s.total_cost) - 1) * 100).toFixed(1)}%</span> vs cost`
-      : '<span>—</span>';
-    el.kpiRoas.textContent     = (s.avg_roas ?? 0).toFixed(2) + '×';
-    el.kpiRoasSub.innerHTML    = (s.avg_roas ?? 0) >= 1
-      ? `<span class="delta up">profitable</span>`
-      : `<span class="delta down">under target</span>`;
-  }
-
-  function renderTable() {
+  // ─── Filtering (pure function, used by both render + totals) ───────────
+  function filteredRows() {
     const q = state.filterQuery.trim().toLowerCase();
-    const rows = state.rows
-      .filter(r => state.filterDate === 'all' || r.target_date === state.filterDate)
-      .filter(r => state.filterStatus === 'all' || r.status === state.filterStatus)
+    return state.rows
+      .filter(r => state.filterDate  === 'all' || r.date          === state.filterDate)
+      .filter(r => state.filterGroup === 'all' || r.account_group === state.filterGroup)
       .filter(r => !q
-        || (r.profile_name || '').toLowerCase().includes(q)
-        || (r.profile_id   || '').toLowerCase().includes(q));
+        || (r.profile_name  || '').toLowerCase().includes(q)
+        || (r.account_group || '').toLowerCase().includes(q));
+  }
 
-    el.rowCount.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'}`;
+  // ─── Real-time aggregations (the rule: totals NEVER come from DB) ─────
+  function computeTotals(rows) {
+    let openSum = 0, adsSum = 0, commSum = 0;
+    const groups = new Set();
+    for (const r of rows) {
+      openSum += (+r.open_channel_cost) || 0;
+      adsSum  += (+r.ads_cost) || 0;
+      commSum += (+r.commission) || 0;
+      if (r.account_group) groups.add(r.account_group);
+    }
+    const costSum = openSum + adsSum;
+    const net     = commSum - costSum;
+    const roas    = costSum > 0 ? commSum / costSum : 0;
+    return {
+      profiles: rows.length,
+      groups: groups.size,
+      open: openSum,
+      ads: adsSum,
+      cost: costSum,
+      commission: commSum,
+      net,
+      roas,
+    };
+  }
 
+  // ─── Render ────────────────────────────────────────────────────────────
+  function render() {
+    const rows = filteredRows();
+    const t = computeTotals(rows);
+
+    el.kpiProfiles.textContent    = t.profiles.toLocaleString();
+    el.kpiProfilesSub.innerHTML   = `<span>${t.groups} กลุ่ม</span>`;
+    el.kpiOpen.textContent        = fmtMoney(t.open);
+    el.kpiOpenSub.innerHTML       = `<span>เปิดช่อง รวมทุกแถว</span>`;
+    el.kpiAds.textContent         = fmtMoney(t.ads);
+    el.kpiAdsSub.innerHTML        = `<span>คอยน์ + ค่าโฆษณา</span>`;
+    el.kpiComm.textContent        = fmtMoney(t.commission);
+    el.kpiCommSub.innerHTML       = t.cost > 0
+      ? `<span class="delta ${t.commission >= t.cost ? 'up' : 'down'}">${((t.commission / t.cost - 1) * 100).toFixed(1)}%</span> เทียบต้นทุน`
+      : `<span>—</span>`;
+    el.kpiNet.textContent         = fmtMoney(t.net);
+    el.kpiNetSub.innerHTML        = t.net >= 0
+      ? `<span class="delta up">กำไร</span>`
+      : `<span class="delta down">ขาดทุน</span>`;
+    el.kpiRoas.textContent        = t.roas.toFixed(2) + '×';
+    el.kpiRoasSub.innerHTML       = t.roas >= 1
+      ? `<span class="delta up">คุ้มทุน</span>`
+      : `<span class="delta down">ต่ำกว่าเป้า</span>`;
+    el.kpiGroups.textContent      = t.groups.toLocaleString();
+
+    el.rowCount.textContent       = `${rows.length} row${rows.length === 1 ? '' : 's'}`;
+    el.lastSync.textContent       = 'Last sync ' + new Date().toLocaleTimeString('th-TH');
+
+    renderTable(rows, t);
+  }
+
+  function renderTable(rows, totals) {
     if (state.loading) {
-      el.tbody.innerHTML = `
-        <tr><td colspan="7" class="empty">
-          <div><span class="spinner"></span> Loading…</div>
-        </td></tr>`;
+      el.tbody.innerHTML = `<tr><td colspan="7" class="empty"><span class="spinner"></span> Loading…</td></tr>`;
+      el.tfootSum.innerHTML = '';
       return;
     }
-
     if (!rows.length) {
       el.tbody.innerHTML = `
         <tr><td colspan="7" class="empty">
@@ -227,57 +237,63 @@
               <path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>
             </svg>
           </div>
-          <div>No results match your filters.</div>
+          <div>ไม่พบข้อมูลตามตัวกรอง</div>
         </td></tr>`;
+      el.tfootSum.innerHTML = '';
       return;
     }
 
     el.tbody.innerHTML = rows.map(rowHTML).join('');
+
+    // Real-time sum row in <tfoot>
+    el.tfootSum.innerHTML = `
+      <tr class="sum-row">
+        <td colspan="3"><strong>รวม (${rows.length} แถว)</strong></td>
+        <td class="num"><strong>${fmtMoney(totals.open)}</strong></td>
+        <td class="num"><strong>${fmtMoney(totals.ads)}</strong></td>
+        <td class="num"><strong>${fmtMoney(totals.commission)}</strong></td>
+        <td class="num"><strong class="${totals.net >= 0 ? 'pos' : 'neg'}">${fmtMoney(totals.net)}</strong></td>
+      </tr>`;
   }
 
   function rowHTML(r) {
-    const initials = (r.profile_name || r.profile_id).split(/[-_ ]/).slice(0, 2)
-      .map(s => s.charAt(0)).join('').toUpperCase().slice(0, 2) || '?';
-    const grad = pickGradient(r.profile_id);
-    const status = r.status === 'Success'
-      ? `<span class="badge success"><span class="dot"></span>Success</span>`
-      : `<span class="badge failed"><span class="dot"></span>Failed</span>
-         ${r.error_reason ? `<div class="reason">${escapeHTML(r.error_reason)}</div>` : ''}`;
+    const initials = (r.profile_name || '?').slice(0, 2).toUpperCase();
+    const grad = pickGradient(r.profile_name);
+    const cost = (+r.open_channel_cost || 0) + (+r.ads_cost || 0);
+    const net  = (+r.commission || 0) - cost;
     return `
       <tr>
         <td>
           <div class="profile">
-            <div class="avatar" style="background:${grad}">${initials}</div>
+            <div class="avatar" style="background:${grad}">${escapeHTML(initials)}</div>
             <div>
               <div>${escapeHTML(r.profile_name || '—')}</div>
-              <div class="profile-id">${escapeHTML(r.profile_id)}</div>
             </div>
           </div>
         </td>
-        <td><span class="badge muted">${r.target_date}</span></td>
-        <td class="num">${fmtMoney(r.ads_cost)}</td>
-        <td class="num">${fmtMoney(r.est_commission)}</td>
-        <td class="num">${r.roas != null ? r.roas.toFixed(2) + '×' : '—'}</td>
-        <td>${status}</td>
-        <td class="num">${(r.duration_ms / 1000).toFixed(1)}s</td>
+        <td><span class="badge muted">${r.date}</span></td>
+        <td>${r.account_group ? `<span class="badge muted">${escapeHTML(r.account_group)}</span>` : '<span class="dim">—</span>'}</td>
+        <td class="num">${fmtMoney(+r.open_channel_cost)}</td>
+        <td class="num">${fmtMoney(+r.ads_cost)}</td>
+        <td class="num">${fmtMoney(+r.commission)}</td>
+        <td class="num ${net >= 0 ? 'pos' : 'neg'}">${fmtMoney(net)}</td>
       </tr>`;
   }
 
-  // ─── Utils ───────────────────────────────────────────────────────────
+  // ─── Utils ─────────────────────────────────────────────────────────────
   function fmtMoney(v) {
-    if (v == null) return '—';
-    if (Math.abs(v) >= 1_000_000) return '฿' + (v / 1_000_000).toFixed(2) + 'M';
-    if (Math.abs(v) >= 1_000)     return '฿' + (v / 1_000).toFixed(1) + 'k';
-    return '฿' + Math.round(v).toLocaleString();
+    if (v == null || isNaN(v)) return '—';
+    const sign = v < 0 ? '-' : '';
+    const abs = Math.abs(v);
+    if (abs >= 1_000_000) return sign + '฿' + (abs / 1_000_000).toFixed(2) + 'M';
+    if (abs >= 1_000)     return sign + '฿' + (abs / 1_000).toFixed(1) + 'k';
+    return sign + '฿' + Math.round(abs).toLocaleString();
   }
-
   function escapeHTML(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     }[c]));
   }
-
-  // deterministic gradient per profile id
   const GRADIENTS = [
     'linear-gradient(135deg,#a78bfa,#60a5fa)',
     'linear-gradient(135deg,#f472b6,#fb923c)',
@@ -292,26 +308,13 @@
     return GRADIENTS[h % GRADIENTS.length];
   }
 
-  // ─── Events ──────────────────────────────────────────────────────────
-  el.dateSel.addEventListener('change', () => {
-    state.filterDate = el.dateSel.value;
-    load();
-  });
-  el.seg.querySelectorAll('button').forEach(b => {
-    b.addEventListener('click', () => {
-      el.seg.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', 'false'));
-      b.setAttribute('aria-pressed', 'true');
-      state.filterStatus = b.dataset.value;
-      load();
-    });
-  });
-  el.search.addEventListener('input', () => {
-    state.filterQuery = el.search.value;
-    renderTable();
-  });
-  el.refresh.addEventListener('click', () => load());
+  // ─── Events ────────────────────────────────────────────────────────────
+  el.dateSel.addEventListener('change', () => { state.filterDate  = el.dateSel.value;  render(); });
+  el.groupSel.addEventListener('change',() => { state.filterGroup = el.groupSel.value; render(); });
+  el.search.addEventListener('input',   () => { state.filterQuery = el.search.value;   render(); });
+  el.refresh.addEventListener('click',  () => load());
 
-  // ─── Boot ────────────────────────────────────────────────────────────
+  // ─── Boot ──────────────────────────────────────────────────────────────
   (async function boot() {
     setApiStatus();
     await probe();

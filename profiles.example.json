@@ -1,14 +1,17 @@
 [
   {
-    "id":   "GOLOGIN_PROFILE_ID_1",
-    "name": "Shop-Bangkok-01"
+    "id":    "GOLOGIN_PROFILE_ID_1",
+    "name":  "lonaharper",
+    "group": "kshomeaxie29"
   },
   {
-    "id":   "GOLOGIN_PROFILE_ID_2",
-    "name": "Shop-Bangkok-02"
+    "id":    "GOLOGIN_PROFILE_ID_2",
+    "name":  "kingmolly",
+    "group": "kshomeaxie29"
   },
   {
-    "id":   "GOLOGIN_PROFILE_ID_3",
-    "name": "Shop-Bangkok-03"
+    "id":    "GOLOGIN_PROFILE_ID_3",
+    "name":  "jayden_th",
+    "group": "vinhomeaxie44"
   }
 ]
